@@ -5,3 +5,4 @@ __pycache__/
 venv/
 vectorstore/
 data/india/patents/*_OCR.pdf
+data/runtime/
