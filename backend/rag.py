@@ -9,9 +9,13 @@ from dotenv import load_dotenv
 from google import genai
 from sentence_transformers import SentenceTransformer
 
+from backend.source_registry import trusted_source_for
+
 
 INDEX_FILE = Path("vectorstore/index.faiss")
 METADATA_FILE = Path("vectorstore/metadata.json")
+INTERNATIONAL_INDEX_FILE = Path("vectorstore/index_international.faiss")
+INTERNATIONAL_METADATA_FILE = Path("vectorstore/metadata_international.json")
 
 # Support both FastAPI imports and the module's existing command-line entry point.
 load_dotenv()
@@ -20,6 +24,14 @@ load_dotenv()
 MIN_RETRIEVAL_SCORE = 0.42
 MIN_STRONG_SEMANTIC_SCORE = 0.60
 MIN_STRONG_SEMANTIC_RESULTS = 2
+# A paraphrased question can have one very strong match and a second supporting
+# government chunk just below the top-tier semantic threshold.  These values
+# are deliberately used only together, for authoritative corroborated results;
+# they are not a replacement for the baseline threshold below.
+MIN_CORROBORATED_SEMANTIC_SCORE = 0.52
+MIN_CORROBORATING_SCORE = 0.42
+MIN_CORROBORATING_RESULTS = 2
+MIN_CORROBORATED_AVERAGE_SCORE = 0.46
 MIN_CLAIM_SIMILARITY = 0.35
 MIN_KEYWORD_OVERLAP = 0.12
 # A near-verbatim statutory claim can have a lower embedding score when the
@@ -41,24 +53,124 @@ STOP_WORDS = {
 
 index = faiss.read_index(str(INDEX_FILE))
 chunks = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
+international_index = (
+    faiss.read_index(str(INTERNATIONAL_INDEX_FILE))
+    if INTERNATIONAL_INDEX_FILE.exists() else None
+)
+international_chunks = (
+    json.loads(INTERNATIONAL_METADATA_FILE.read_text(encoding="utf-8"))
+    if INTERNATIONAL_METADATA_FILE.exists() else []
+)
 # The embedding model is already part of the local runtime; avoid a network
 # metadata check when starting the API so retrieval remains available offline.
 model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
-def retrieve(query, top_k=5, jurisdiction="india", allowed_categories=None):
-    """Return the existing exact-section and FAISS evidence results."""
+def plan_clarification_with_gemini(user_query, conversation_context="", workflow_context="", jurisdiction="india", deterministic_analysis=None):
+    """Ask the configured Gemini model for a JSON-only clarification plan."""
+    from backend.query_understanding import ALLOWED_DOMAINS, ALLOWED_INTENTS, QUESTION_FIELD_SCHEMA
+
+    prompt = {
+        "task": "Plan the minimum useful clarification questions for the Sahayak query. Do not answer the legal question.",
+        "user_query": user_query,
+        "conversation_context": conversation_context,
+        "workflow_context": workflow_context,
+        "jurisdiction": jurisdiction,
+        "deterministic_findings": deterministic_analysis or {},
+        "rules": [
+            "Return one JSON object only; no markdown.",
+            "Use the latest explicit user correction over older context.",
+            "Ask no more than five questions, and do not repeat known or answered facts.",
+            "Use only the approved field names, intent values, and domain values supplied below.",
+            "Return question_plan items with only field and question.",
+            "Do not provide legal conclusions, citations, or claim facts that are not in the inputs.",
+            "If no material information is missing, return an empty question_plan and needs_clarification false.",
+        ],
+        "approved_fields": list(QUESTION_FIELD_SCHEMA),
+        "approved_intents": sorted(ALLOWED_INTENTS),
+        "approved_domains": sorted(ALLOWED_DOMAINS),
+        "json_shape": {"goal": "string", "primary_intent": "approved intent", "secondary_intents": [], "domains": [], "known_facts": {}, "missing_fields": [], "needs_clarification": True, "question_plan": [{"field": "approved field", "question": "short question"}]},
+    }
+    response = client.interactions.create(model="gemini-3.6-flash", input=json.dumps(prompt, ensure_ascii=False))
+    raw = (response.output_text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)
+    return json.loads(raw)
+
+
+def retrieve(query, top_k=5, jurisdiction="india", allowed_categories=None, allowed_domains=None):
+    """Return selected-jurisdiction evidence from the configured vector store.
+
+    FAISS remains the default. Qdrant is an opt-in adapter over the same curated
+    chunks and embeddings, selected with VECTOR_STORE_BACKEND=qdrant.
+    """
+    if os.getenv("VECTOR_STORE_BACKEND", "faiss").lower() == "qdrant":
+        if jurisdiction.lower() not in {"india", "international"}:
+            return []
+        from backend.qdrant_store import search_chunks
+
+        query_embedding = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
+        return search_chunks(
+            query_embedding, jurisdiction, top_k,
+            allowed_categories=allowed_categories, allowed_domains=allowed_domains,
+        )
+    if jurisdiction.lower() == "international":
+        active_index, active_chunks = international_index, international_chunks
+    elif jurisdiction.lower() == "india":
+        active_index, active_chunks = index, chunks
+    else:
+        return []
+    # Never fall back to another jurisdiction when its index is unavailable.
+    if active_index is None or not active_chunks:
+        return []
+
     exact_matches = []
     direct_subclause_matches = []
     section_match = re.search(
         r"\bsection\s+(\d+)([a-z]?)(?:\(([a-z0-9]+)\))?", query.lower()
     )
 
+    def chunk_domains(chunk):
+        if chunk.get("domain"):
+            return {chunk["domain"]}
+        is_india_patent = chunk.get("jurisdiction", "").lower() == "india"
+        patent_domains = {"patent"}
+        if is_india_patent and re.search(
+            r"\b(?:traditional knowledge|prior art|tkdl)\b", chunk.get("text", ""), re.I
+        ):
+            patent_domains.add("tkdl_prior_art")
+        category_domains = {
+            "Patent": patent_domains,
+            "Ayush Patent Guidelines": patent_domains,
+            "Biodiversity": {"abs"},
+            "Access and Benefit Sharing": {"abs"},
+            "Traditional Knowledge": {"tkdl_prior_art"},
+            "Trademark": {"trademark"},
+            "Design": {"design"},
+            "Intellectual Property": {"ip"},
+        }
+        return category_domains.get(chunk.get("category"), set())
+
+    def matches_domain(chunk):
+        return not allowed_domains or bool(chunk_domains(chunk) & allowed_domains)
+
+    def source_fields(chunk):
+        registered = trusted_source_for(chunk["document"])
+        matching_domains = chunk_domains(chunk) & (allowed_domains or chunk_domains(chunk))
+        return {
+            "domain": chunk.get("domain") or (sorted(matching_domains)[0] if matching_domains else None),
+            "source_organization": chunk.get("source_organization") or registered.get("source_organization") or chunk.get("source"),
+            "document_version": chunk.get("document_version") or registered.get("document_version"),
+            "document_status": chunk.get("document_status") or registered.get("document_status"),
+            "official_listing_url": registered.get("official_listing_url"),
+            "official_pdf_url": registered.get("official_pdf_url"),
+            "official_url": registered.get("official_pdf_url") or registered.get("official_listing_url") or chunk.get("official_url") or chunk.get("source_url"),
+        }
+
     if section_match:
         section_number, section_suffix, subsection = section_match.groups()
         section_pattern = "section " + section_number + section_suffix
-        for chunk in chunks:
+        for chunk in active_chunks:
             # The extracted Patents Act places Section 3 subclauses on a
             # continuation page where the "Section 3" heading is absent.
             # Match the requested subclause as an additional, narrow path so
@@ -75,13 +187,20 @@ def retrieve(query, top_k=5, jurisdiction="india", allowed_categories=None):
             )
             if (
                 chunk["jurisdiction"].lower() == jurisdiction.lower()
-                and (not allowed_categories or chunk["category"] in allowed_categories)
+                and matches_domain(chunk)
+                and (allowed_categories is None or chunk["category"] in allowed_categories)
                 and (section_pattern in chunk["text"].lower() or subclause_match)
             ):
+                source_info = source_fields(chunk)
                 match = {
                     "score": 1.0,
                     "document": chunk["document"],
+                    "jurisdiction": chunk["jurisdiction"],
+                    **source_info,
                     "category": chunk["category"],
+                    "section": chunk.get("section"),
+                    "rule": chunk.get("rule"),
+                    "regulation": chunk.get("regulation"),
                     "page": chunk["page"],
                     "source": chunk["source"],
                     "text": chunk["text"],
@@ -93,18 +212,28 @@ def retrieve(query, top_k=5, jurisdiction="india", allowed_categories=None):
     query_embedding = model.encode(
         [query], convert_to_numpy=True, normalize_embeddings=True
     )
-    scores, indices = index.search(query_embedding, 15)
+    scores, indices = active_index.search(query_embedding, min(15, len(active_chunks)))
     results = []
     for score, idx in zip(scores[0], indices[0]):
-        chunk = chunks[idx]
+        if idx < 0:
+            continue
+        chunk = active_chunks[idx]
         if chunk["jurisdiction"].lower() != jurisdiction.lower():
             continue
-        if allowed_categories and chunk["category"] not in allowed_categories:
+        if not matches_domain(chunk):
             continue
+        if allowed_categories is not None and chunk["category"] not in allowed_categories:
+            continue
+        source_info = source_fields(chunk)
         results.append({
             "score": float(score),
             "document": chunk["document"],
+            "jurisdiction": chunk["jurisdiction"],
+            **source_info,
             "category": chunk["category"],
+            "section": chunk.get("section"),
+            "rule": chunk.get("rule"),
+            "regulation": chunk.get("regulation"),
             "page": chunk["page"],
             "source": chunk["source"],
             "text": chunk["text"],
@@ -205,7 +334,7 @@ def extract_citations(answer):
 
 def _source_metadata(document, page):
     """Get display metadata; its text is never used unless it was retrieved."""
-    for chunk in chunks:
+    for chunk in chunks + international_chunks:
         if chunk["document"] == document and chunk["page"] == page:
             return chunk
     return None
@@ -264,8 +393,20 @@ def verify_citation_support(answer, results):
             "page": citation["page"],
             "category": metadata["category"] if metadata else None,
             "source": metadata["source"] if metadata else None,
+            "jurisdiction": metadata.get("jurisdiction") if metadata else None,
+            "domain": metadata.get("domain") if metadata else None,
+            "source_organization": metadata.get("source_organization", metadata.get("source")) if metadata else None,
+            "document_version": metadata.get("document_version") if metadata else None,
+            "document_status": metadata.get("document_status") if metadata else None,
+            "section": metadata.get("section") if metadata else None,
+            "rule": metadata.get("rule") if metadata else None,
+            "regulation": metadata.get("regulation") if metadata else None,
+            "official_listing_url": trusted_source_for(citation["document"]).get("official_listing_url"),
+            "official_pdf_url": trusted_source_for(citation["document"]).get("official_pdf_url"),
+            "official_url": trusted_source_for(citation["document"]).get("official_pdf_url") or trusted_source_for(citation["document"]).get("official_listing_url") or (metadata or {}).get("official_url"),
             "reference_valid": reference_valid,
             "content_supported": content_supported,
+            "citation_verified": content_supported,
             "verification_status": "supported" if content_supported else "unsupported",
             "claim": citation["claim"],
             "semantic_similarity": round(similarity, 3),
@@ -291,9 +432,10 @@ def has_sufficient_evidence(question, results):
     if any(result["score"] == 1.0 for result in results):
         return True
     best_score = max(result["score"] for result in results)
-    authoritative_results = [
-        result for result in results if result["source"] == "IP India"
-    ]
+    # Both jurisdiction-specific indexes are curated from trusted primary
+    # authorities. Their source label is preserved per chunk (IP India, WIPO,
+    # WTO, CBD, etc.); require that label before using corroboration thresholds.
+    authoritative_results = [result for result in results if result.get("source")]
     strong_semantic_results = [
         result for result in authoritative_results
         if result["score"] >= MIN_STRONG_SEMANTIC_SCORE
@@ -308,6 +450,24 @@ def has_sufficient_evidence(question, results):
         and len(strong_semantic_results) >= MIN_STRONG_SEMANTIC_RESULTS
     ):
         return True
+
+    # Preserve safe abstention for a single, merely plausible hit.  This path
+    # accepts paraphrased queries only when the curated authority produces a
+    # strong lead plus a second independently retrieved corroborating chunk.
+    # Citation verification still evaluates every generated claim afterwards.
+    corroborating_results = [
+        result for result in authoritative_results
+        if result["score"] >= MIN_CORROBORATING_SCORE
+    ]
+    if len(corroborating_results) >= MIN_CORROBORATING_RESULTS:
+        top_scores = sorted(
+            (result["score"] for result in corroborating_results), reverse=True
+        )[:MIN_CORROBORATING_RESULTS]
+        if (
+            top_scores[0] >= MIN_CORROBORATED_SEMANTIC_SCORE
+            and sum(top_scores) / len(top_scores) >= MIN_CORROBORATED_AVERAGE_SCORE
+        ):
+            return True
 
     # Retain lexical corroboration for merely moderate retrieval, preserving
     # safe abstention for unrelated questions that happen to have one match.
@@ -333,7 +493,7 @@ def confidence_from_evidence(results, citations):
     return "low"
 
 
-def generate_answer(question, results):
+def generate_answer(question, results, domain=None):
     context = ""
     for i, result in enumerate(results, 1):
         context += f"""
@@ -349,28 +509,56 @@ Content:
 --------------------------------
 """
 
+    prior_art_rules = """
+11. This is an evidence pointer, not a TKDL database search. The available
+    corpus contains public guidance and treaty material, not record-level
+    TKDL entries. For a question asking whether a formulation is listed,
+    explicitly state that authoritative record-level TKDL evidence could not
+    be retrieved and abstain from yes/no conclusions.
+12. Do not describe general guidance, a treaty, or a different formulation
+    as a match to the user's formulation. A possible prior-art indication
+    requires retrieved text that directly matches the supplied ingredients,
+    preparation, or stated use. Even then, do not decide novelty or patentability.
+13. State that formal patent examination is required whenever discussing a
+    possible prior-art indication.
+""" if domain == "tkdl_prior_art" else ""
+
     prompt = f"""
 You are IP-SAKTI Sahayak, an Ayurveda Intellectual Property,
 Regulatory and ABS guidance assistant.
 
-Answer the user's question using ONLY the government-document context below.
+Answer the user's question using ONLY the authoritative-source context below.
 
 IMPORTANT RULES:
-1. Give one clear, direct answer using only the supplied context.
-2. Do not invent laws, sections, rules, cases, dates, facts, or authorities.
-3. Cite every factual or legal claim inline in exactly this format:
+1. Answer using ONLY the supplied government-document context. Do not use
+   background knowledge, assumptions, or facts not contained in that context.
+2. Give a clear, direct answer first. Do not repeat the user's question.
+3. Synthesize relevant passages together when they collectively support a
+   qualified answer; do not treat each source passage as an isolated answer.
+4. Do not invent laws, sections, rules, cases, dates, authorities, treaty
+   provisions, URLs, patent requirements, or facts.
+5. Cite every factual or legal claim inline in exactly this format:
    [Document: exact document name; Page: exact page number]
-4. A citation may only use a document and page supplied in the context.
-5. Clearly identify a qualified conclusion as a conclusion, rather than as a
-   direct statement of the source.
-6. If the context genuinely has no sufficient information, reply exactly:
+   A citation may only use a document and page supplied in the context.
+6. Preserve legal caution. Use qualified language such as "may", "depends on",
+   "subject to", or "the retrieved guidance indicates" whenever appropriate.
+   Do not guarantee approval, rejection, registration, or legal compliance.
+7. If the context genuinely has no sufficient information, reply exactly:
    "{ABSTENTION_MESSAGE}"
-7. Do not provide legal advice.
+8. Do not provide legal advice.
+9. Do not abstain solely because the user's wording is broader than the
+   document's example or category. When the supplied evidence supports a
+   conditional conclusion, explain that condition narrowly and cite the
+   supporting document and page. Do not extend that conclusion beyond what
+   the supplied evidence says.
+10. Use short paragraphs and, where useful, concise bullets headed "Key
+    points". Do not force a fixed structure for a short factual answer.
+{prior_art_rules}
 
 USER QUESTION:
 {question}
 
-GOVERNMENT DOCUMENT CONTEXT:
+AUTHORITATIVE SOURCE CONTEXT:
 {context}
 """
     response = client.interactions.create(model="gemini-3.6-flash", input=prompt)

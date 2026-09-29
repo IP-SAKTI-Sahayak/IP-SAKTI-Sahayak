@@ -13,7 +13,23 @@ files = [
     (
         "data/india/ayush/Guidelines_Ayush_Related_Inventions_2025.pdf",
         "data/extracted/Guidelines_Ayush_Related_Inventions_2025.txt"
-    )
+    ),
+    (
+        "data/india/abs/Biological_Diversity_Act_2002_amended_2023_KSBB.pdf",
+        "data/extracted/Biological_Diversity_Act_2002_amended_2023.txt"
+    ),
+    (
+        "data/india/abs/Biological_Diversity_Rules_2024_Gazette.pdf",
+        "data/extracted/Biological_Diversity_Rules_2024.txt"
+    ),
+    (
+        "data/india/abs/Biological_Diversity_Amendment_Rules_2025_Gazette.pdf",
+        "data/extracted/Biological_Diversity_Amendment_Rules_2025.txt"
+    ),
+    (
+        "data/india/abs/Biological_Diversity_ABS_Regulations_2025_NBA.pdf",
+        "data/extracted/Biological_Diversity_ABS_Regulations_2025.txt"
+    ),
 ]
 
 for pdf_file, txt_file in files:

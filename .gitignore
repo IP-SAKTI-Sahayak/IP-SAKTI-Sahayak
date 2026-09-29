@@ -6,3 +6,5 @@ venv/
 vectorstore/
 data/india/patents/*_OCR.pdf
 data/runtime/
+
+frontend/node_modules/.vite/
